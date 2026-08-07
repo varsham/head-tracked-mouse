@@ -1,11 +1,17 @@
 """
 Calibration dot display + frame capture for Week 1/2 data collection.
 
-Shows one dot at a time at a known screen coordinate. Press SPACE to capture
-a burst of frames from the webcam, extract each frame's fused feature vector
-(pitch, yaw, roll, left/right iris position) via facemesh.py, and log every
-frame as a row in calibration_points.csv alongside the dot's target
-coordinates. Press ESC to quit early.
+On start, choose a mode:
+  - Manual (M): dot waits for you to press SPACE, then a short settle delay
+    lets your eyes fixate before the burst capture begins. Good for testing.
+  - Automatic (A): each dot settles and captures on its own timer, then
+    advances -- no keypress needed. Closer to how an actual user would sit
+    through calibration.
+
+Each captured frame's fused feature vector (pitch, yaw, roll, left/right
+iris position) is computed via facemesh.py and logged as a row in
+calibration_points.csv alongside the dot's target coordinates.
+Press ESC any time to quit early.
 
 Points are laid out on a grid using Chebyshev-Lobatto spacing, which
 clusters points near the screen edges and spaces them out near the
@@ -26,12 +32,19 @@ import cv2
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import facemesh
 
-ROWS = 5
+ROWS = 10
 COLS = 10
 MARGIN_PX = 60
 DOT_RADIUS = 12
 OUTPUT_CSV = "calibration_points.csv"
 FRAMES_PER_POINT = 100
+SETTLE_MS = 800  # time to let eyes fixate on a new dot before capturing starts
+
+MODE_MANUAL = "manual"
+MODE_AUTO = "auto"
+
+LABEL_FONT = ("Helvetica", 16)
+STATUS_FONT = ("Helvetica", 48, "bold")  # large enough to catch in peripheral vision
 
 
 def chebyshev_lobatto_fractions(n):
@@ -68,6 +81,7 @@ class CalibrationApp:
         self.points = generate_points(self.width, self.height, ROWS, COLS, MARGIN_PX)
         self.index = 0
         self.capturing = False
+        self.mode = None
 
         self.canvas = tk.Canvas(
             root, width=self.width, height=self.height,
@@ -79,17 +93,47 @@ class CalibrationApp:
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow([
             "point_index", "frame_index", "timestamp", "target_x", "target_y",
-            "pitch", "yaw", "roll",
+            "pitch", "yaw", "roll", "pose_reprojection_error",
             "left_iris_x", "left_iris_y", "right_iris_x", "right_iris_y",
+            "left_ear", "right_ear",
         ])
 
         self.cap = cv2.VideoCapture(0)
         self.face_mesh = facemesh.create_face_mesh()
 
-        self.root.bind("<space>", self.on_advance)
         self.root.bind("<Escape>", self.on_quit)
+        self.show_mode_selection()
+
+    # -- mode selection ----------------------------------------------------
+
+    def show_mode_selection(self):
+        self.canvas.delete("all")
+        self.canvas.create_text(
+            self.width / 2, self.height / 2,
+            text="Press M for Manual mode\nPress A for Automatic mode",
+            fill="white", font=("Helvetica", 28), justify="center"
+        )
+        self.root.bind("<m>", self.start_manual)
+        self.root.bind("<a>", self.start_auto)
+
+    def start_manual(self, event):
+        self._start_mode(MODE_MANUAL)
+
+    def start_auto(self, event):
+        self._start_mode(MODE_AUTO)
+
+    def _start_mode(self, mode):
+        self.mode = mode
+        self.root.unbind("<m>")
+        self.root.unbind("<a>")
+        if mode == MODE_MANUAL:
+            self.root.bind("<space>", self.on_space)
 
         self.draw_current_point()
+        if mode == MODE_AUTO:
+            self.root.after(SETTLE_MS, self.begin_capture)
+
+    # -- drawing -------------------------------------------------------
 
     def draw_current_point(self, status=None):
         self.canvas.delete("all")
@@ -107,10 +151,45 @@ class CalibrationApp:
             x - DOT_RADIUS, y - DOT_RADIUS, x + DOT_RADIUS, y + DOT_RADIUS,
             fill="red", outline=""
         )
-        label = status or f"Point {self.index + 1}/{len(self.points)} -- look at the dot, press SPACE"
-        self.canvas.create_text(
-            self.width / 2, 30, text=label, fill="white", font=("Helvetica", 16)
-        )
+
+        if status:
+            self.canvas.create_text(
+                self.width / 2, 60, text=status, fill="yellow", font=STATUS_FONT
+            )
+        else:
+            hint = "hold still" if self.mode == MODE_AUTO else "look at the dot, press SPACE"
+            self.canvas.create_text(
+                self.width / 2, 30,
+                text=f"Point {self.index + 1}/{len(self.points)} -- {hint}",
+                fill="white", font=LABEL_FONT
+            )
+
+    # -- capture flow ----------------------------------------------------
+
+    def on_space(self, event):
+        if self.capturing or self.index >= len(self.points):
+            return
+        self.capturing = True
+        self.draw_current_point(status="Capturing. Hold still...")
+        self.root.after(SETTLE_MS, self.begin_capture)
+
+    def begin_capture(self):
+        if self.index >= len(self.points):
+            return
+
+        self.capturing = True
+        self.draw_current_point(status="Capturing. Hold still...")
+        self.root.update()  # force the status text to paint before the blocking burst
+
+        logged, missed = self.capture_burst()
+        print(f"Point {self.index}: logged {logged} frames, missed {missed}")
+
+        self.capturing = False
+        self.index += 1
+        self.draw_current_point()
+
+        if self.mode == MODE_AUTO and self.index < len(self.points):
+            self.root.after(SETTLE_MS, self.begin_capture)
 
     def capture_burst(self):
         """Captures FRAMES_PER_POINT frames and writes one CSV row per successful frame."""
@@ -141,28 +220,15 @@ class CalibrationApp:
             self.csv_writer.writerow([
                 self.index, frame_idx, time.time(), x, y,
                 features["pitch"], features["yaw"], features["roll"],
+                features["pose_reprojection_error"],
                 features["left_iris_x"], features["left_iris_y"],
                 features["right_iris_x"], features["right_iris_y"],
+                features["left_ear"], features["right_ear"],
             ])
             logged += 1
 
         self.csv_file.flush()
         return logged, missed
-
-    def on_advance(self, event):
-        if self.capturing or self.index >= len(self.points):
-            return
-
-        self.capturing = True
-        self.draw_current_point(status="Capturing... hold still")
-        self.root.update()  # force the "Capturing..." label to paint before the blocking burst
-
-        logged, missed = self.capture_burst()
-        print(f"Point {self.index}: logged {logged} frames, missed {missed}")
-
-        self.capturing = False
-        self.index += 1
-        self.draw_current_point()
 
     def on_quit(self, event):
         self.csv_file.close()
