@@ -1,3 +1,5 @@
+import math
+
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -37,6 +39,13 @@ MODEL_POINTS_3D = np.array([
 LEFT_IRIS_IDXS = sorted({i for pair in mp_face_mesh.FACEMESH_LEFT_IRIS for i in pair})
 RIGHT_IRIS_IDXS = sorted({i for pair in mp_face_mesh.FACEMESH_RIGHT_IRIS for i in pair})
 
+# Eye landmark indices for EAR (eye aspect ratio), in [corner, top1, top2,
+# corner, bottom2, bottom1] order to match the standard EAR formula. This is
+# the widely-used 6-point set for MediaPipe's mesh; verify against the live
+# preview overlay if EAR values look off for your face/camera angle.
+LEFT_EYE_EAR_IDXS = [362, 385, 387, 263, 373, 380]
+RIGHT_EYE_EAR_IDXS = [33, 160, 158, 133, 153, 144]
+
 
 def create_face_mesh():
     """Factory so other scripts can build a FaceMesh instance identically to this one."""
@@ -67,7 +76,14 @@ def _landmark_px(face_landmarks, idx, width, height):
 
 
 def estimate_head_pose(face_landmarks, width, height):
-    """Returns (pitch, yaw, roll) in degrees, or None if solvePnP fails."""
+    """
+    Returns (pitch, yaw, roll, reprojection_error) in degrees/pixels, or None
+    if solvePnP fails. reprojection_error is the mean pixel distance between
+    the detected landmarks and where the fitted rigid head model predicts
+    they should be -- a high value means the landmarks don't agree with a
+    rigid head (e.g. partial occlusion, bad detection), even when solvePnP
+    "succeeds".
+    """
     image_points = np.array([
         _landmark_px(face_landmarks, POSE_LANDMARK_IDXS["nose_tip"], width, height),
         _landmark_px(face_landmarks, POSE_LANDMARK_IDXS["chin"], width, height),
@@ -80,7 +96,7 @@ def estimate_head_pose(face_landmarks, width, height):
     camera_matrix = get_camera_matrix(width, height)
     dist_coeffs = np.zeros((4, 1))
 
-    success, rotation_vector, _ = cv2.solvePnP(
+    success, rotation_vector, translation_vector = cv2.solvePnP(
         MODEL_POINTS_3D, image_points, camera_matrix, dist_coeffs,
         flags=cv2.SOLVEPNP_ITERATIVE
     )
@@ -90,7 +106,14 @@ def estimate_head_pose(face_landmarks, width, height):
     rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
     angles, _, _, _, _, _ = cv2.RQDecomp3x3(rotation_matrix)
     pitch, yaw, roll = angles
-    return pitch, yaw, roll
+
+    reprojected, _ = cv2.projectPoints(
+        MODEL_POINTS_3D, rotation_vector, translation_vector, camera_matrix, dist_coeffs
+    )
+    reprojected = reprojected.reshape(-1, 2)
+    reprojection_error = float(np.mean(np.linalg.norm(reprojected - image_points, axis=1)))
+
+    return pitch, yaw, roll, reprojection_error
 
 
 def _centroid_px(face_landmarks, idxs, width, height):
@@ -106,34 +129,57 @@ def get_iris_centers(face_landmarks, width, height):
     return left, right
 
 
+def _eye_aspect_ratio(face_landmarks, idxs, width, height):
+    p1, p2, p3, p4, p5, p6 = [_landmark_px(face_landmarks, i, width, height) for i in idxs]
+    vertical = math.dist(p2, p6) + math.dist(p3, p5)
+    horizontal = math.dist(p1, p4)
+    return vertical / (2.0 * horizontal)
+
+
+def get_ear(face_landmarks, width, height):
+    """Returns (left_ear, right_ear). Lower values mean the eye is more closed."""
+    left = _eye_aspect_ratio(face_landmarks, LEFT_EYE_EAR_IDXS, width, height)
+    right = _eye_aspect_ratio(face_landmarks, RIGHT_EYE_EAR_IDXS, width, height)
+    return left, right
+
+
 def extract_fused_features(face_landmarks, width, height):
     """
-    Returns the Week 1 fused feature dict (pitch, yaw, roll, left/right iris
-    position), or None if head pose couldn't be estimated for this frame.
+    Returns the fused feature dict (pitch, yaw, roll, left/right iris
+    position, left/right EAR, pose reprojection error), or None if head pose
+    couldn't be estimated for this frame.
     """
     pose = estimate_head_pose(face_landmarks, width, height)
     if pose is None:
         return None
-    pitch, yaw, roll = pose
+    pitch, yaw, roll, reprojection_error = pose
+
     (left_iris_x, left_iris_y), (right_iris_x, right_iris_y) = get_iris_centers(
         face_landmarks, width, height
     )
+    left_ear, right_ear = get_ear(face_landmarks, width, height)
+
     return {
         "pitch": pitch,
         "yaw": yaw,
         "roll": roll,
+        "pose_reprojection_error": reprojection_error,
         "left_iris_x": left_iris_x,
         "left_iris_y": left_iris_y,
         "right_iris_x": right_iris_x,
         "right_iris_y": right_iris_y,
+        "left_ear": left_ear,
+        "right_ear": right_ear,
     }
 
 
 def _draw_feature_overlay(image, features):
     lines = [
-        f"pitch: {features['pitch']:.1f}  yaw: {features['yaw']:.1f}  roll: {features['roll']:.1f}",
+        f"pitch: {features['pitch']:.1f}  yaw: {features['yaw']:.1f}  roll: {features['roll']:.1f}"
+        f"  reproj err: {features['pose_reprojection_error']:.1f}px",
         f"L iris: ({features['left_iris_x']:.0f}, {features['left_iris_y']:.0f})"
         f"  R iris: ({features['right_iris_x']:.0f}, {features['right_iris_y']:.0f})",
+        f"L EAR: {features['left_ear']:.2f}  R EAR: {features['right_ear']:.2f}",
     ]
     for i, line in enumerate(lines):
         cv2.putText(
