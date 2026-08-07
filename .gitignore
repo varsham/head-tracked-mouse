@@ -40,6 +40,7 @@ models/*.pkl
 models/*.h5
 models/*.pt
 models/*.onnx
+tests/gather_data/*.csv
 
 # Logs
 *.log
