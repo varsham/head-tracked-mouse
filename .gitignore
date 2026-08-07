@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+venv/
+env/
+.venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+
+# CV / ML project data
+data/
+datasets/
+calibration_data/
+frames/
+*.mp4
+*.avi
+checkpoints/
+models/*.pkl
+models/*.h5
+models/*.pt
+models/*.onnx
+
+# Logs
+*.log
