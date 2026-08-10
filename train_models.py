@@ -40,7 +40,8 @@ from sklearn.preprocessing import PolynomialFeatures
 
 FEATURE_COLUMNS = [
     "pitch", "yaw", "roll",
-    "left_iris_x", "left_iris_y", "right_iris_x", "right_iris_y",
+    "left_iris_rel_x", "left_iris_rel_y", "right_iris_rel_x", "right_iris_rel_y",
+    "left_ear", "right_ear",
 ]
 TARGET_COLUMNS = ["target_x", "target_y"]
 

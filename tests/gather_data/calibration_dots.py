@@ -8,6 +8,12 @@ On start, choose a mode:
     advances -- no keypress needed. Closer to how an actual user would sit
     through calibration.
 
+During the burst capture (after the settle delay), move your head side to
+side while keeping your eyes on the dot -- this gives the model many
+different (head pose, iris position) pairs that all map to the same target,
+which is what it needs to learn to fuse the two instead of only ever seeing
+near-static head position per point.
+
 Each captured frame's fused feature vector (pitch, yaw, roll, left/right
 iris position) is computed via facemesh.py and logged as a row in
 calibration_points.csv alongside the dot's target coordinates.
@@ -94,7 +100,7 @@ class CalibrationApp:
         self.csv_writer.writerow([
             "point_index", "frame_index", "timestamp", "target_x", "target_y",
             "pitch", "yaw", "roll", "pose_reprojection_error",
-            "left_iris_x", "left_iris_y", "right_iris_x", "right_iris_y",
+            "left_iris_rel_x", "left_iris_rel_y", "right_iris_rel_x", "right_iris_rel_y",
             "left_ear", "right_ear",
         ])
 
@@ -170,7 +176,7 @@ class CalibrationApp:
         if self.capturing or self.index >= len(self.points):
             return
         self.capturing = True
-        self.draw_current_point(status="Capturing. Hold still...")
+        self.draw_current_point(status="Hold still, look at the dot...")
         self.root.after(SETTLE_MS, self.begin_capture)
 
     def begin_capture(self):
@@ -178,7 +184,7 @@ class CalibrationApp:
             return
 
         self.capturing = True
-        self.draw_current_point(status="Capturing. Hold still...")
+        self.draw_current_point(status="Capturing. Move head side to side,\nkeep eyes on the dot")
         self.root.update()  # force the status text to paint before the blocking burst
 
         logged, missed = self.capture_burst()
@@ -221,8 +227,8 @@ class CalibrationApp:
                 self.index, frame_idx, time.time(), x, y,
                 features["pitch"], features["yaw"], features["roll"],
                 features["pose_reprojection_error"],
-                features["left_iris_x"], features["left_iris_y"],
-                features["right_iris_x"], features["right_iris_y"],
+                features["left_iris_rel_x"], features["left_iris_rel_y"],
+                features["right_iris_rel_x"], features["right_iris_rel_y"],
                 features["left_ear"], features["right_ear"],
             ])
             logged += 1
