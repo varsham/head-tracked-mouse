@@ -39,7 +39,6 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import PolynomialFeatures
 
 FEATURE_COLUMNS = [
-    "pitch", "yaw", "roll",
     "left_iris_rel_x", "left_iris_rel_y", "right_iris_rel_x", "right_iris_rel_y",
     "left_ear", "right_ear",
 ]

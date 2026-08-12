@@ -6,27 +6,31 @@ On start, choose a mode:
     lets your eyes fixate before the burst capture begins. Good for testing.
   - Automatic (A): each dot settles and captures on its own timer, then
     advances -- no keypress needed. Closer to how an actual user would sit
-    through calibration.
+    through calibration. Press SPACE any time between points to pause
+    (and again to resume) -- useful for a break during a 150-point session.
 
-During the burst capture (after the settle delay), move your head side to
-side while keeping your eyes on the dot -- this gives the model many
-different (head pose, iris position) pairs that all map to the same target,
-which is what it needs to learn to fuse the two instead of only ever seeing
-near-static head position per point.
+Keep your head still throughout -- eyes are the only signal driving gaze
+prediction for now, so head movement is noise, not useful diversity like it
+would be if head pose were a model input.
 
 Each captured frame's fused feature vector (pitch, yaw, roll, left/right
-iris position) is computed via facemesh.py and logged as a row in
+iris position, EAR) is computed via facemesh.py and logged as a row in
 calibration_points.csv alongside the dot's target coordinates.
 Press ESC any time to quit early.
 
 Points are laid out on a grid using Chebyshev-Lobatto spacing, which
 clusters points near the screen edges and spaces them out near the
 center -- matching the plan's note that pose/gaze error is worst at
-the edges.
+the edges. The grid positions themselves are fixed, but the order the
+dots are presented in is shuffled each run, so the session isn't a
+predictable row-by-row scan.
 """
 
 import csv
+import json
 import math
+import random
+import statistics
 import sys
 import time
 import tkinter as tk
@@ -34,17 +38,20 @@ from pathlib import Path
 
 import cv2
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 # facemesh.py lives at the project root, two levels up from this file.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(PROJECT_ROOT))
 import facemesh
 
 ROWS = 10
-COLS = 10
+COLS = 15
 MARGIN_PX = 60
 DOT_RADIUS = 12
 OUTPUT_CSV = "calibration_points.csv"
 FRAMES_PER_POINT = 100
 SETTLE_MS = 800  # time to let eyes fixate on a new dot before capturing starts
+HEAD_BASELINE_PATH = PROJECT_ROOT / "head_position_baseline.json"
+DRIFT_THRESHOLD_DEG = 5.0  # max allowed pitch/yaw distance from this point's own baseline
 
 MODE_MANUAL = "manual"
 MODE_AUTO = "auto"
@@ -85,9 +92,12 @@ class CalibrationApp:
         self.height = root.winfo_screenheight()
 
         self.points = generate_points(self.width, self.height, ROWS, COLS, MARGIN_PX)
+        random.shuffle(self.points)  # same grid, but not scanned in a predictable order
         self.index = 0
         self.capturing = False
         self.mode = None
+        self.paused = False  # Auto mode only; toggled by SPACE between points
+        self.all_pitch_yaw = []  # every logged frame's (pitch, yaw), for the session head-position baseline
 
         self.canvas = tk.Canvas(
             root, width=self.width, height=self.height,
@@ -134,10 +144,12 @@ class CalibrationApp:
         self.root.unbind("<a>")
         if mode == MODE_MANUAL:
             self.root.bind("<space>", self.on_space)
+        else:
+            self.root.bind("<space>", self.on_toggle_pause)
 
         self.draw_current_point()
         if mode == MODE_AUTO:
-            self.root.after(SETTLE_MS, self.begin_capture)
+            self.schedule_next_capture()
 
     # -- drawing -------------------------------------------------------
 
@@ -163,7 +175,10 @@ class CalibrationApp:
                 self.width / 2, 60, text=status, fill="yellow", font=STATUS_FONT
             )
         else:
-            hint = "hold still" if self.mode == MODE_AUTO else "look at the dot, press SPACE"
+            if self.mode == MODE_AUTO:
+                hint = "hold still (SPACE to pause)"
+            else:
+                hint = "look at the dot, press SPACE"
             self.canvas.create_text(
                 self.width / 2, 30,
                 text=f"Point {self.index + 1}/{len(self.points)} -- {hint}",
@@ -184,23 +199,72 @@ class CalibrationApp:
             return
 
         self.capturing = True
-        self.draw_current_point(status="Capturing. Move head side to side,\nkeep eyes on the dot")
+        self.draw_current_point(status="Capturing. Keep head still,\nlook at the dot")
+        drift_warning_id = self.canvas.create_text(
+            self.width / 2, self.height - 60, text="",
+            fill="red", font=STATUS_FONT
+        )
         self.root.update()  # force the status text to paint before the blocking burst
 
-        logged, missed = self.capture_burst()
-        print(f"Point {self.index}: logged {logged} frames, missed {missed}")
+        logged, missed, drifted = self.capture_burst(drift_warning_id)
+        self.canvas.delete(drift_warning_id)
+        print(f"Point {self.index}: logged {logged} frames, missed {missed}, drifted {drifted}")
 
         self.capturing = False
         self.index += 1
+
+        if self.index >= len(self.points):
+            self.save_head_baseline()
         self.draw_current_point()
 
         if self.mode == MODE_AUTO and self.index < len(self.points):
-            self.root.after(SETTLE_MS, self.begin_capture)
+            self.schedule_next_capture()
 
-    def capture_burst(self):
+    def schedule_next_capture(self):
+        """Schedules the next begin_capture() call, unless paused -- in
+        which case on_toggle_pause() schedules it instead, once resumed."""
+        if self.paused:
+            return
+        self.root.after(SETTLE_MS, self.begin_capture)
+
+    def on_toggle_pause(self, event):
+        """Auto mode only. Only takes effect between points -- like ESC,
+        it can't interrupt an in-progress capture_burst() since that runs
+        synchronously and doesn't yield back to the event loop."""
+        if self.mode != MODE_AUTO or self.capturing or self.index >= len(self.points):
+            return
+
+        self.paused = not self.paused
+        if self.paused:
+            self.draw_current_point(status="Paused -- press SPACE to resume")
+        else:
+            self.draw_current_point()
+            self.schedule_next_capture()
+
+    def save_head_baseline(self):
+        """
+        Median (pitch, yaw) across the whole session -- the head position
+        this calibration is only valid for. live_gaze_test.py checks against
+        this before starting normal tracking, since the model has no way to
+        detect on its own that you're sitting somewhere different now.
+        """
+        if not self.all_pitch_yaw:
+            return
+        pitches, yaws = zip(*self.all_pitch_yaw)
+        data = {
+            "pitch": statistics.median(pitches),
+            "yaw": statistics.median(yaws),
+        }
+        with open(HEAD_BASELINE_PATH, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"Saved head position baseline to {HEAD_BASELINE_PATH}")
+
+    def capture_burst(self, drift_warning_id):
         """Captures FRAMES_PER_POINT frames and writes one CSV row per successful frame."""
         x, y = self.points[self.index]
-        logged, missed = 0, 0
+        logged, missed, drifted = 0, 0, 0
+        baseline = None
+        warning_active = False
 
         for frame_idx in range(FRAMES_PER_POINT):
             success, frame = self.cap.read()
@@ -223,6 +287,23 @@ class CalibrationApp:
                 missed += 1
                 continue
 
+            # First successfully-detected frame of this point sets the
+            # "head still" baseline everything else is compared against.
+            if baseline is None:
+                baseline = (features["pitch"], features["yaw"])
+
+            drift = math.hypot(features["pitch"] - baseline[0], features["yaw"] - baseline[1])
+            is_drifting = drift > DRIFT_THRESHOLD_DEG
+            if is_drifting:
+                drifted += 1
+            if is_drifting != warning_active:
+                warning_active = is_drifting
+                self.canvas.itemconfig(
+                    drift_warning_id,
+                    text="Head moved -- hold still!" if warning_active else ""
+                )
+                self.root.update_idletasks()
+
             self.csv_writer.writerow([
                 self.index, frame_idx, time.time(), x, y,
                 features["pitch"], features["yaw"], features["roll"],
@@ -231,10 +312,11 @@ class CalibrationApp:
                 features["right_iris_rel_x"], features["right_iris_rel_y"],
                 features["left_ear"], features["right_ear"],
             ])
+            self.all_pitch_yaw.append((features["pitch"], features["yaw"]))
             logged += 1
 
         self.csv_file.flush()
-        return logged, missed
+        return logged, missed, drifted
 
     def on_quit(self, event):
         self.csv_file.close()

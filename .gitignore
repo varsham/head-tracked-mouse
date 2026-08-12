@@ -41,6 +41,7 @@ models/*.h5
 models/*.pt
 models/*.onnx
 tests/gather_data/*.csv
+head_position_baseline.json
 
 # Logs
 *.log
