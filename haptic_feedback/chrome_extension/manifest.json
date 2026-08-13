@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Button Hover Bridge",
+  "version": "1.0",
+  "description": "Reports button hover state to a local bridge for haptic feedback.",
+  "permissions": ["scripting"],
+  "host_permissions": [
+    "http://127.0.0.1:5005/*",
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
